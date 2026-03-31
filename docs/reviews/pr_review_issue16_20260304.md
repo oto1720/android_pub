@@ -1,0 +1,193 @@
+# PR レビューレポート
+
+**PR/ブランチ**: issue16 → main
+**レビュー日時**: 2026-03-04
+**変更規模**: +270 / -4 / 6ファイル（コードファイルのみ）
+
+---
+
+## 🎯 変更の概要
+
+issue #16「記事詳細画面 UI 実装」の対応。`DigestScreen` に WebView・ヘッダー（タイトル＋タグ）・ボタン出し分けを実装。`DigestViewModel` で記事ロードとイベント発行を行い、遷移元（PORTAL / TSUNDOKU）に応じてボタンを切り替える。
+
+**変更種別**:
+- [x] 新機能 (Feature) — ui/digest 層・domain/usecase 層の新規実装
+- [x] 関連修正 — data 層の Repository/Impl 拡張
+
+---
+
+## ✅ マージ判定
+
+> **APPROVE**
+
+完了条件（WebView表示・ボタン出し分け）を満たしている。`DigestEvent` による navigation イベント設計、`SavedStateHandle` での引数取得、`stateFlow` + `SharedFlow` パターンはすべてプロジェクトの既存規約に準拠。指摘事項（m-1）は軽微で任意対応。
+
+---
+
+## 📁 変更ファイル一覧
+
+| ファイル | 変更種別 | +行 | -行 | 懸念度 |
+|---------|---------|-----|-----|--------|
+| `data/repository/ArticleRepository.kt` | Modified | +5 | - | 🟢 問題なし |
+| `data/repository/ArticleRepositoryImpl.kt` | Modified | +3 | - | 🟢 問題なし |
+| `domain/usecase/GetArticleUseCase.kt` | Added | +13 | - | 🟢 問題なし |
+| `ui/digest/DigestUiState.kt` | Added | +20 | - | 🟢 問題なし |
+| `ui/digest/DigestViewModel.kt` | Added | +65 | - | 🟢 問題なし |
+| `ui/digest/DigestScreen.kt` | Modified | +266 | -4 | 🟡 軽微 |
+| `test/.../DigestViewModelTest.kt` | Added | +143 | - | 🟢 問題なし |
+
+---
+
+## 🔍 詳細レビュー
+
+### data/repository/ArticleRepository.kt — 🟢 問題なし
+
+`getArticleById(id: String): ArticleEntity?` を追加。nullable 戻り値で「記事なし」を表現するのは適切。
+
+---
+
+### domain/usecase/GetArticleUseCase.kt — 🟢 問題なし
+
+```kotlin
+// ✅ シンプルな委譲UseCase
+suspend operator fun invoke(id: String): ArticleEntity? = repository.getArticleById(id)
+```
+
+---
+
+### ui/digest/DigestUiState.kt — 🟢 問題なし
+
+#### 良い点
+- `DigestEvent` に `AddedToTsundoku` / `SlotFull` / `MarkedAsDone` の3イベントを定義し、画面遷移をViewModelが制御できる設計 ✅
+- `PortalEvent` と同様の sealed interface パターンで一貫性 ✅
+
+---
+
+### ui/digest/DigestViewModel.kt — 🟢 問題なし
+
+#### 良い点
+- `SavedStateHandle["articleId"]` で型安全に引数を取得 ✅
+- `addToTsundoku()` の結果（成功/満杯）を両方イベントに変換し、UI側で判断させる設計 ✅
+- `markAsDone()` 後に `MarkedAsDone` イベントを発行して navigation を UI に委ねる ✅
+
+```kotlin
+// ✅ イベント2分岐でUI側のナビゲーション責務を明確化
+fun addToTsundoku() {
+    viewModelScope.launch {
+        val added = addToTsundokuUseCase(articleId)
+        _event.emit(if (added) DigestEvent.AddedToTsundoku else DigestEvent.SlotFull)
+    }
+}
+```
+
+---
+
+### ui/digest/DigestScreen.kt — 🟡 軽微
+
+#### 良い点
+- `DigestScreen` (hiltViewModel注入) / `DigestScreenContent` (internal) の分離で PortalScreen と同パターン ✅
+- `AndroidView` + `WebViewClient` で正しく WebView を Compose に埋め込み ✅
+- `settings.domStorageEnabled = true` で現代的な Web ページの互換性確保 ✅
+- `ArticleStatus.TSUNDOKU` 時の「AI要約」ボタンを `enabled = false` で明示的に無効化（issue19 で実装予定） ✅
+- `LaunchedEffect(Unit)` でイベント収集し、遷移先を `onNavigateToTsundoku` / `onNavigateToDone` に委ねる ✅
+
+#### 指摘事項
+
+**[🟡 m-1] `AndroidView.update` が毎回 `loadUrl` を呼ぶ可能性** (`DigestScreen.kt:234`)
+
+`update` ブロックは Compose の再コンポーズの度に実行される。`url` が変化していないのに `loadUrl` を呼ぶと余分なネットワークリクエストが発生する。`key` を使って状態変化時のみ呼ぶか、`url` が変化した時のみリロードするガードが望ましい。
+
+```kotlin
+// 🟡 現在（再コンポーズ毎に loadUrl が呼ばれる可能性）
+AndroidView(
+    factory = { context ->
+        WebView(context).apply { ... loadUrl(url) }
+    },
+    update = { webView ->
+        webView.loadUrl(url)  // ← 再コンポーズ毎に実行
+    },
+)
+```
+
+```kotlin
+// 💡 改善案：url が変化した時のみリロード
+AndroidView(
+    factory = { context ->
+        WebView(context).apply {
+            webViewClient = WebViewClient()
+            settings.javaScriptEnabled = true
+            settings.domStorageEnabled = true
+            loadUrl(url)
+        }
+    },
+    update = { webView ->
+        if (webView.url != url) webView.loadUrl(url)
+    },
+)
+```
+
+---
+
+### test/.../DigestViewModelTest.kt — 🟢 問題なし
+
+#### 良い点
+- 7ケースでロード・addToTsundoku 両分岐・markAsDone を網羅 ✅
+- `SavedStateHandle` をテスト内で直接インスタンス化（Hilt 不要） ✅
+- `PortalViewModelTest` と同パターンで一貫性 ✅
+
+---
+
+## ⚠️ 影響範囲
+
+**このPRの変更が影響する箇所**:
+- `ArticleRepository` インターフェース追加 → `ArticleRepositoryImpl` に実装追加
+- `DigestScreen` がシグネチャ変更なし（`hiltViewModel()` を内部で使用するだけ）
+
+**破壊的変更**: なし（`DigestScreen` の公開シグネチャは変更なし）
+
+---
+
+## 🧪 テスト確認
+
+| テスト項目 | 状態 |
+|-----------|------|
+| init: Loading 初期状態 | ✅ |
+| init: 記事あり → Success | ✅ |
+| init: 記事なし → Error | ✅ |
+| init: 正しい articleId で UseCase 呼ぶ | ✅ |
+| addToTsundoku: 成功 → AddedToTsundoku | ✅ |
+| addToTsundoku: 満杯 → SlotFull | ✅ |
+| markAsDone: DONE で updateStatus 呼ぶ | ✅ |
+| markAsDone: MarkedAsDone イベント発行 | ✅ |
+
+---
+
+## 💬 レビューコメント（コピペ用）
+
+**全体コメント**:
+```
+レビューしました。APPROVE です 👍
+
+WebView 埋め込み・ヘッダー（タイトル+タグ）・ボタン出し分け（PORTAL/TSUNDOKU）
+すべて実装されており、完了条件を満たしています。
+
+軽微な改善として、AndroidView の update ブロックで
+url が変化した時のみ loadUrl を呼ぶことを検討してください（m-1）。
+
+詳細は docs/reviews/pr_review_issue16_20260304.md を参照してください。
+```
+
+---
+
+## ✅ チェックリスト
+
+- [x] `DigestScreen` Composable を実装
+- [x] `WebView` を Compose に埋め込む（`AndroidView`）
+- [x] 上部に記事タイトル・タグを表示（TopAppBar）
+- [x] ポータルからの遷移時は「積読に追加」ボタンを表示（PORTAL status）
+- [x] 積読からの遷移時は「AI要約」「読了宣言」ボタンを表示（TSUNDOKU status）
+- [x] `DigestViewModel` を実装（StateFlow + SharedFlow）
+- [x] `DigestViewModelTest` を追加（8ケース）
+
+---
+*Generated by Claude Code / pr-review skill*

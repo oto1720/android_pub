@@ -1,0 +1,196 @@
+# PR レビューレポート
+
+**PR/ブランチ**: issue12 → main
+**レビュー日時**: 2026-03-03
+**変更規模**: +155 / -22 / 3ファイル（コードファイルのみ）
+
+---
+
+## 🎯 変更の概要
+
+issue #12「ポータル画面 UI 実装」の対応。PortalScreen Composable を実装し、記事一覧・タグフィルター・Loading/Error 状態を画面に表示する。
+
+**変更種別**:
+- [x] 新機能 (Feature) — ui/portal 層の画面実装
+
+---
+
+## ✅ マージ判定
+
+> **APPROVE**
+
+issue #12 の完了条件（Qiita 記事が画面に一覧表示されること）を満たしている。レビュー指摘事項（タグ抽出ロジックの Composable 内への混入）を修正済み。`PortalScreen` / `PortalScreenContent` の適切な分離、`LazyColumn` の `key` 指定など、Compose のベストプラクティスを踏まえた実装。
+
+---
+
+## 📁 変更ファイル一覧
+
+| ファイル | 変更種別 | +行 | -行 | 懸念度 |
+|---------|---------|-----|-----|--------|
+| `ui/portal/PortalUiState.kt` | Modified | +3 | -1 | 🟢 問題なし |
+| `ui/portal/PortalViewModel.kt` | Modified | +7 | -1 | 🟢 問題なし |
+| `ui/portal/PortalScreen.kt` | Modified | +145 | -20 | 🟡 軽微 |
+
+---
+
+## 🔍 詳細レビュー
+
+### ui/portal/PortalUiState.kt — 🟢 問題なし
+
+#### 変更の意図
+`Success` に `availableTags: List<String>` を追加し、タグ抽出ロジックを ViewModel に集約。
+
+#### 良い点
+- `availableTags = emptyList()` をデフォルト値にして既存テストへの影響を最小化 ✅
+- UI 層でのタグ処理計算を排除 ✅
+
+```kotlin
+// ✅ availableTags を ViewModel で構築し UiState に持たせる
+data class Success(
+    val articles: List<ArticleEntity>,
+    val availableTags: List<String> = emptyList(),
+) : PortalUiState
+```
+
+---
+
+### ui/portal/PortalViewModel.kt — 🟢 問題なし
+
+#### 変更の意図
+`loadArticlesInternal` で記事取得成功時に `availableTags` を構築して `PortalUiState.Success` に渡す。
+
+#### 良い点
+- タグ抽出・`distinct()`・`sorted()` のロジックが ViewModel に集約 ✅
+- 空文字・空白をフィルタリングする堅牢な実装 ✅
+
+```kotlin
+// ✅ ViewModel でタグリストを構築
+.onSuccess { articles ->
+    val availableTags = articles
+        .flatMap { it.tags.split(",").map(String::trim).filter(String::isNotEmpty) }
+        .distinct()
+        .sorted()
+    _uiState.value = PortalUiState.Success(articles, availableTags)
+}
+```
+
+---
+
+### ui/portal/PortalScreen.kt — 🟡 軽微
+
+#### 変更の意図
+`PortalScreen` を完全実装。ViewModel 依存を `PortalScreen` に閉じ込め、`PortalScreenContent` で状態に応じた UI を表示。`ArticleCard` で記事の title・tags・date を表示。
+
+#### 良い点
+- `PortalScreen` (ViewModel 依存) と `PortalScreenContent` (pure state 受け取り) を `internal` で分離しテスタブル ✅
+- `LazyColumn` の `key = { it.id }` で不要なリコンポジションを防止 ✅
+- `FilterChip` でタグフィルター UI を実装（「すべて」チップ付き） ✅
+- Loading/Error/Success の3状態に適切に対応 ✅
+- Error 状態でリトライボタンを表示 ✅
+- `formatDate` の例外ハンドリングでクラッシュリスクを排除 ✅
+
+```kotlin
+// ✅ ViewModel 依存を PortalScreen に閉じ込め
+@Composable
+fun PortalScreen(
+    ...
+    viewModel: PortalViewModel = hiltViewModel(),
+) {
+    val uiState by viewModel.uiState.collectAsState()
+    val selectedTag by viewModel.selectedTag.collectAsState()
+    PortalScreenContent(...)
+}
+```
+
+#### 指摘事項
+
+**[🟡 m-1] `onNavigateToTsundoku` / `onNavigateToDone` が未使用** (`PortalScreen.kt:37-38`)
+
+既存の `AppNavHost` の契約上 signature を維持しているが、`PortalScreenContent` には渡されておらず、現時点では未使用。将来の Bottom Navigation 実装時に使用予定であれば意図をコメントで明示することを推奨。
+
+```kotlin
+// 現在（許容範囲）
+fun PortalScreen(
+    onNavigateToTsundoku: () -> Unit,  // 現時点では未使用
+    onNavigateToDone: () -> Unit,      // 現時点では未使用
+    ...
+```
+
+**[🟡 m-2] `formatDate` で `SimpleDateFormat` を毎回インスタンス化** (`PortalScreen.kt:178-185`)
+
+`SimpleDateFormat` は `LazyColumn` のアイテム数分だけ新規インスタンスが生成される。各呼び出しで新規インスタンスを作るため thread-safety の問題はないが、パフォーマンス上は非効率。minSdk=24 のため `java.time` は使えないが、将来 core library desugaring が導入された場合は `DateTimeFormatter` への移行を推奨。
+
+```kotlin
+// 現在（動作上は問題なし）
+private fun formatDate(isoDate: String): String {
+    val inputFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US)
+    val outputFormat = SimpleDateFormat("yyyy/MM/dd", Locale.US)
+    ...
+}
+```
+
+**[🟡 m-3] `ArticleCard` のタグに `tags = ""` の場合 `isNotEmpty()` チェックが必要** (`PortalScreen.kt:152`)
+
+`article.tags.isNotEmpty()` で空文字チェックをしているが、`"  "` のような空白文字列の場合は表示されてしまう。現実的なリスクは低いが `article.tags.isNotBlank()` の方が安全。
+
+---
+
+## ⚠️ 影響範囲
+
+**このPRの変更が影響する箇所**:
+- `PortalUiState.Success` に `availableTags` フィールドを追加（デフォルト値あり、破壊的変更なし）
+- `AppNavHost` は変更不要（`PortalScreen` の signature は変わらず）
+
+**破壊的変更**: なし
+
+---
+
+## 🧪 テスト確認
+
+| テスト項目 | 状態 |
+|-----------|------|
+| PortalViewModelTest 全9ケース | ✅ |
+| `availableTags` 構築ロジック（ViewModel 側） | ✅（テストでは `emptyList()` articles でカバー） |
+
+**不足テスト（推奨）**:
+- `PortalScreenContent` の Composable UI テスト（Loading 時にインジケーターが表示されるか等）
+- `ArticleCard` のレンダリングテスト
+
+---
+
+## 💬 レビューコメント（コピペ用）
+
+**全体コメント**:
+```
+レビューしました。APPROVE です 👍
+
+PortalScreen / PortalScreenContent の分離、LazyColumn の key 指定、
+Loading / Error / Success への対応など Compose のベストプラクティスを
+踏まえた実装です。
+
+修正点：
+- タグ抽出ロジックを Composable から ViewModel に移動
+  (PortalUiState.Success.availableTags として公開)
+- ArticleCard の Spacer を 4dp に統一
+
+軽微な改善として、将来 core library desugaring が導入されたら
+SimpleDateFormat → DateTimeFormatter への移行を検討してください（m-2）。
+
+詳細は docs/reviews/pr_review_issue12_20260303.md を参照してください。
+```
+
+---
+
+## ✅ チェックリスト
+
+- [x] `PortalScreen` Composable を実装
+- [x] `LazyColumn` で記事カードを一覧表示
+- [x] `ArticleCard` Composable を実装（タイトル・タグ・日付）
+- [x] タグフィルター用 `FilterChip` 行を追加（「すべて」チップ付き）
+- [x] ローディング中は `CircularProgressIndicator`
+- [x] エラー時はリトライボタンを表示
+- [x] タグ抽出ロジックを ViewModel に集約（`PortalUiState.Success.availableTags`）
+- [x] Compose ベストプラクティス（`key` 指定、ViewModel/Screen 分離）
+
+---
+*Generated by Claude Code / pr-review skill*
